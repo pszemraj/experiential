@@ -5,7 +5,8 @@ from __future__ import annotations
 
 import pytest
 
-from exp.common.core.artifacts import JsonObject
+from exp.common.core.artifacts import JsonObject, JsonValue
+from exp.common.models.content import ImageContentPart
 from exp.runtime.gateway.contracts import (
     GatewayApiSurface,
     GatewayMessage,
@@ -187,6 +188,158 @@ def test_convert_history_custom_tool_call_roundtrips() -> None:
     assert messages[1].tool_call_id == "call_1"
     assert messages[1].content == "done"
     assert mapping.resolve("apply_patch") == ("apply_patch", None, True)
+
+
+_CODEX_LIST_OUTPUT: list[JsonObject] = [
+    {"type": "input_text", "text": "Script completed\n"},
+    {"type": "input_text", "text": "gateway test file\n"},
+]
+"""The list-form freeform result Codex sends after an ``exec`` custom tool call."""
+
+
+def _custom_output_history(output: JsonValue) -> tuple[GatewayMessage, ...]:
+    """Build a custom tool call followed by its result carrying ``output``.
+
+    Args:
+        output: The raw ``custom_tool_call_output.output`` value under test.
+
+    Returns:
+        The two raw native history messages, as decode carries them.
+    """
+    return (
+        GatewayMessage(
+            role="assistant",
+            provider_native_item={
+                "type": "custom_tool_call",
+                "call_id": "call_1",
+                "name": "exec",
+                "input": "cat data.txt",
+            },
+        ),
+        GatewayMessage(
+            role="tool",
+            provider_native_item={
+                "type": "custom_tool_call_output",
+                "call_id": "call_1",
+                "output": output,
+            },
+        ),
+    )
+
+
+def test_convert_history_list_custom_output_joins_text_parts() -> None:
+    """An all-text list result reaches a foreign wire as its joined text."""
+    history = _custom_output_history(_CODEX_LIST_OUTPUT)
+    messages, disclosures = convert_native_history(history, NativeToolMapping())
+    result = messages[1]
+    assert result.role == "tool"
+    assert result.tool_call_id == "call_1"
+    assert result.content == "Script completed\ngateway test file\n"
+    assert result.content_parts == ()
+    assert disclosures == []
+
+
+def test_convert_history_list_custom_output_keeps_tool_images() -> None:
+    """A text and image list result keeps both parts in the caller's order."""
+    history = _custom_output_history(
+        [
+            {"type": "input_text", "text": "screenshot:"},
+            {"type": "input_image", "image_url": "data:image/png;base64,aGk=", "detail": "low"},
+        ]
+    )
+    messages, disclosures = convert_native_history(history, NativeToolMapping())
+    result = messages[1]
+    assert result.content == "screenshot:"
+    assert [part.kind for part in result.content_parts] == ["text", "image"]
+    image = result.content_parts[1]
+    assert isinstance(image, ImageContentPart)
+    assert (image.media_type, image.data, image.detail) == ("image/png", "aGk=", "low")
+    assert disclosures == []
+
+
+@pytest.mark.parametrize(
+    "unsupported",
+    [
+        {"type": "input_file", "file_id": "file_1"},
+        {"type": "input_image", "file_id": "file_1"},
+        {"type": "input_image", "image_url": "data:image/tiff;base64,aGk="},
+        "not a part",
+    ],
+)
+def test_convert_history_list_custom_output_discloses_unsupported_parts(
+    unsupported: JsonObject | str,
+) -> None:
+    """A part the tool message cannot carry is omitted with a disclosure, text retained."""
+    history = _custom_output_history([{"type": "input_text", "text": "kept"}, unsupported])
+    messages, disclosures = convert_native_history(history, NativeToolMapping())
+    assert messages[1].content == "kept"
+    assert messages[1].content_parts == ()
+    assert disclosures == ["input.custom_tool_call_output.output->dropped(unsupported_part)"]
+
+
+@pytest.mark.parametrize("output", [None, 7, {"type": "input_text", "text": "x"}])
+def test_convert_history_malformed_custom_output_is_disclosed(output: JsonValue) -> None:
+    """A result that is neither a string nor a part list is disclosed, not silently emptied."""
+    messages, disclosures = convert_native_history(
+        _custom_output_history(output), NativeToolMapping()
+    )
+    assert messages[1].content == ""
+    assert disclosures == ["input.custom_tool_call_output.output->dropped(malformed)"]
+
+
+def _tool_result_content(payload: JsonObject, dialect: str) -> object:
+    """Return the tool result content a provider payload carries for ``call_1``.
+
+    Args:
+        payload: The provider request body built for ``dialect``.
+        dialect: ``openai_compatible`` (a Chat tool message) or
+            ``anthropic_messages`` (a ``tool_result`` block).
+
+    Returns:
+        The tool result's content exactly as serialized for the provider.
+    """
+    messages = payload["messages"]
+    assert isinstance(messages, list)
+    for message in messages:
+        assert isinstance(message, dict)
+        if dialect == "openai_compatible" and message.get("role") == "tool":
+            return message["content"]
+        blocks = message.get("content")
+        if dialect == "anthropic_messages" and isinstance(blocks, list):
+            for block in blocks:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    return block["content"]
+    raise AssertionError(f"no tool result in the {dialect} payload")
+
+
+@pytest.mark.parametrize("dialect", ["openai_compatible", "anthropic_messages"])
+def test_codex_list_custom_output_reaches_the_foreign_provider_payload(dialect: str) -> None:
+    """Codex's list-form freeform result is served, not emptied, on a translated route."""
+    body: JsonObject = {
+        "model": "coding",
+        "tools": [_CUSTOM],
+        "input": [
+            {"type": "message", "role": "user", "content": "Read data.txt."},
+            {
+                "type": "custom_tool_call",
+                "call_id": "call_1",
+                "name": "apply_patch",
+                "input": "*** Begin Patch",
+            },
+            {"type": "custom_tool_call_output", "call_id": "call_1", "output": _CODEX_LIST_OUTPUT},
+        ],
+    }
+    request = decode_responses(body).request
+    profile = GatewayWireProfile(
+        dialect=dialect,
+        url="http://127.0.0.1:9/v1",
+        model_id="same-model",
+        maximum_output_tokens=128_000,
+    )
+    public, shaped = route_generation_parameter_requests((profile,), request)
+    payload = dialect_stream_payload(profile, shaped)
+    assert _tool_result_content(payload, dialect) == "Script completed\ngateway test file\n"
+    assert not any("custom_tool_call_output" in item for item in public.ignored_parameters)
 
 
 def test_convert_history_additional_tools_dropped() -> None:

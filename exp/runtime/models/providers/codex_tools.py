@@ -31,9 +31,10 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from exp.common.models import ToolCall
+from exp.common.models.content import MessageContentPart, TextContentPart, image_part_from_url
 from exp.runtime.gateway.contracts import GatewayMessage, GatewayToolDefinition
 from exp.runtime.gateway.tool_search.contracts import GATEWAY_TOOL_SEARCH_NAME
 from exp.runtime.models.providers.errors import ProviderParameterError
@@ -46,6 +47,16 @@ if TYPE_CHECKING:
 _HOSTED_TOOL_TYPES = frozenset({"web_search", "tool_search"})
 """Native Responses tools the provider executes server-side; no foreign wire
 can run them, so they drop with disclosure."""
+
+_TOOL_OUTPUT_TEXT_TYPES = frozenset({"input_text", "output_text"})
+"""Result part types whose ``text`` joins the canonical tool message content."""
+
+_IMAGE_DETAILS: dict[str, Literal["auto", "low", "high"]] = {
+    "auto": "auto",
+    "low": "low",
+    "high": "high",
+}
+"""Image ``detail`` hints the canonical image part carries; any other value is omitted."""
 
 
 class TranslatedTool:
@@ -193,6 +204,72 @@ def mangle(namespace: str | None, name: str) -> str:
 
 def _string(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
+
+
+def _tool_output_message(
+    call_id: str, output: object, item_type: str
+) -> tuple[GatewayMessage, str | None]:
+    """Map a native tool result onto the canonical tool message for a foreign wire.
+
+    A string result is the message content. The SDK list form maps its text and
+    image parts onto the canonical tool message in the caller's order, the same
+    carrier a decoded ``function_call_output`` list uses, so each wire's existing
+    tool-image handling applies. The item stays valid verbatim on the native
+    Responses wire, so a part the tool message cannot carry is omitted with a
+    disclosure rather than failing the request.
+
+    Args:
+        call_id: The tool call this result answers.
+        output: The raw ``output`` value of the native result item.
+        item_type: The native item type, used to name the disclosure.
+
+    Returns:
+        The canonical tool message and, when any of the result was omitted, the
+        disclosure naming that omission.
+    """
+    if isinstance(output, str):
+        return GatewayMessage(role="tool", tool_call_id=call_id, content=output), None
+    if not isinstance(output, list):
+        message = GatewayMessage(role="tool", tool_call_id=call_id, content="")
+        return message, f"input.{item_type}.output->dropped(malformed)"
+    parts: list[MessageContentPart] = []
+    omitted = False
+    for part in output:
+        if not isinstance(part, dict):
+            omitted = True
+            continue
+        part_type = part.get("type")
+        text = part.get("text")
+        if part_type in _TOOL_OUTPUT_TEXT_TYPES and isinstance(text, str):
+            # An empty text part carries nothing, and Anthropic and Gemini
+            # reject an empty block, so it drops without a disclosure.
+            if text:
+                parts.append(TextContentPart(text=text))
+            continue
+        url = part.get("image_url")
+        if part_type == "input_image" and isinstance(url, str):
+            detail = part.get("detail")
+            try:
+                parts.append(
+                    image_part_from_url(
+                        url,
+                        detail=_IMAGE_DETAILS.get(detail) if isinstance(detail, str) else None,
+                    )
+                )
+            except ValueError:
+                omitted = True
+            continue
+        omitted = True
+    content = "".join(part.text for part in parts if part.kind == "text")
+    has_image = any(part.kind == "image" for part in parts)
+    message = GatewayMessage(
+        role="tool",
+        tool_call_id=call_id,
+        content=content,
+        content_parts=tuple(parts) if has_image else (),
+    )
+    disclosure = f"input.{item_type}.output->dropped(unsupported_part)" if omitted else None
+    return message, disclosure
 
 
 def _function_definition(
@@ -472,17 +549,9 @@ def _convert_history_item(
         return GatewayMessage(role="assistant", tool_calls=(call,)), None
     if item_type == "custom_tool_call_output":
         call_id = _string(item.get("call_id"))
-        output = item.get("output")
         if call_id is None:
             return None, "input.custom_tool_call_output->dropped(malformed)"
-        return (
-            GatewayMessage(
-                role="tool",
-                tool_call_id=call_id,
-                content=output if isinstance(output, str) else "",
-            ),
-            None,
-        )
+        return _tool_output_message(call_id, item.get("output"), "custom_tool_call_output")
     if item_type == "function_call":
         call_id = _string(item.get("call_id"))
         name = _string(item.get("name"))
@@ -503,17 +572,9 @@ def _convert_history_item(
         return GatewayMessage(role="assistant", tool_calls=(call,)), None
     if item_type == "function_call_output":
         call_id = _string(item.get("call_id"))
-        output = item.get("output")
         if call_id is None:
             return None, "input.function_call_output->dropped(malformed)"
-        return (
-            GatewayMessage(
-                role="tool",
-                tool_call_id=call_id,
-                content=output if isinstance(output, str) else "",
-            ),
-            None,
-        )
+        return _tool_output_message(call_id, item.get("output"), "function_call_output")
     if item_type == "tool_search_call":
         # The gateway's own tool-search round echoed back: replay it as the
         # function call the model actually made, so the conversation stays whole.
